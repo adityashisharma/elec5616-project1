@@ -1,99 +1,87 @@
 import socket
 import threading
-
-from lib.comms import SecureChannel  # Secure version of connection (AES + HMAC + replay)
+from lib.comms import SecureChannel  
 from lib.files import p2p_download_file, set_keys_from_secret
 
-# Track the port we bind to so we don’t connect to ourselves
-server_port = 1337
+bot_port = 1337  
 
 
-def find_bot():
-    """
-    Search for another bot listening on localhost,
-    skipping our own port.
-    """
-    print("Finding another bot...")
+def scan_for_bot():  # Scans localhost for other bots and returns a SecureChannel
+    print("Searching for active bot...")
     port = 1337
-    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     while True:
-        if port == server_port:
+        if port == bot_port:
             port += 1
             continue
 
         try:
-            conn.connect(("localhost", port))
-            sconn = SecureChannel(conn, client=True)
-
-            # Inject shared secret for file encryption/HMAC
-            set_keys_from_secret(sconn.shared_secret)
-
-            print("Found bot on port %d" % port)
-            return sconn
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(("localhost", port))
+            secure = SecureChannel(sock, client=True)
+            set_keys_from_secret(secure.shared_secret)
+            print("Connected to peer on port %d" % port)
+            return secure
         except socket.error:
-            print("No bot was listening on port %d" % port)
+            print("Port %d not responding..." % port)
             port += 1
 
 
-def echo_server(sconn):
-    """
-    Echoes messages back to the sender until termination signal is received.
-    """
+def echo_mode(sconn):  # Echo mode: sends back received messages, handles 'replay' test triggers
     while True:
-        data = sconn.recv()
-        print("ECHOING>", data)
-        sconn.send(data)
+        incoming = sconn.recv()
+        print("ECHO>", incoming)
 
-        if data in (b"X", b"exit", b"quit"):
-            print("Closing connection...")
+        if incoming == b"replay":
+            sconn.replay_last_received()
+            continue
+
+        sconn.send(incoming)
+
+        if incoming == b"replay_recv":
+            sconn.replay_last_received()
+
+        if incoming in (b"X", b"exit", b"quit"):
+            print("Terminating connection...")
             sconn.close()
             return
 
 
-def accept_connection(conn):
-    """
-    Accept an incoming socket connection and route it
-    to either echo or file download logic.
-    """
+def handle_connection(sock):  # Wraps socket in SecureChannel and handles echo/file commands
     try:
-        sconn = SecureChannel(conn, server=True)
+        secure = SecureChannel(sock, server=True)
+        set_keys_from_secret(secure.shared_secret)
 
-        # Set up lib.files' encryption system with shared secret
-        set_keys_from_secret(sconn.shared_secret)
+        command = secure.recv()
 
-        cmd = sconn.recv()
+        if command == b"ECHO":
+            echo_mode(secure)
+        elif command == b"FILE":
+            p2p_download_file(secure)
 
-        if cmd == b"ECHO":
-            echo_server(sconn)
-        elif cmd == b"FILE":
-            p2p_download_file(sconn)
     except socket.error:
-        print("Connection closed unexpectedly")
-    except Exception as e:
-        print("Secure connection error:", e)
+        print("Peer disconnected unexpectedly.")
+    except Exception as err:
+        print("Secure session error:", err)
 
 
-def bot_server():
-    """
-    Runs a threaded socket server to accept connections from other bots.
-    """
-    global server_port
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def launch_bot_server():  # Starts listener and accepts incoming secure connections on available port
+    global bot_port
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     while True:
         try:
-            s.bind(("localhost", server_port))
-            print("Listening on port %d" % server_port)
+            listener.bind(("localhost", bot_port))
+            print("Bot listening on port %d" % bot_port)
             break
         except socket.error:
-            print("Port %d not available" % server_port)
-            server_port += 1
+            print("Port %d in use, trying next..." % bot_port)
+            bot_port += 1
 
-    s.listen(5)
+    listener.listen(5)
 
     while True:
-        print("Waiting for connection...")
-        conn, address = s.accept()
-        print("Accepted a connection from %s..." % (address,))
-        threading.Thread(target=accept_connection, args=(conn,)).start()
+        print("Awaiting new connection...")
+        conn, addr = listener.accept()
+        print("Connected by", addr)
+        threading.Thread(target=handle_connection, args=(conn,)).start()
