@@ -1,139 +1,159 @@
 import struct
-import os
 from Crypto.Cipher import AES
-from Crypto.Hash import HMAC, SHA256
-from Crypto.Random import get_random_bytes
+from Crypto.Hash import HMAC, SHA512
 
-from dh import create_dh_key, calculate_dh_secret
+from dh import generate_keypair, compute_shared_secret
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
 
 
-class SecureChannel:
-    def __init__(self, conn, client=False, server=False, verbose=False):
-        self.conn = conn
-        self.client = client
-        self.server = server
-        self.verbose = verbose
+class SecureChannel: # Handles secure communication using AES encryption, HMAC integrity, and replay protection.
+    def __init__(self, socket, is_client=False, is_server=False, debug=False):
+        self.socket = socket
+        self.is_client = is_client
+        self.is_server = is_server
+        self.debug = debug
 
-        self.shared_secret = None
-        self.aes_key = None
-        self.mac_key = None
-        self.used_nonces = set()
+        # Security parameters
+        self._secret = None
+        self._enc_key = None
+        self._mac_key = None
+        self._iv_seed = None
 
-        self.initiate_session()
+        self._seq = 0
+        self._replay_check = set()
 
-    def initiate_session(self):
-        """
-        Perform Diffie-Hellman key exchange and derive AES and MAC keys.
-        """
-        my_public, my_private = create_dh_key()
+        # Track most recent sent and received messages
+        self._outgoing = None
+        self._incoming = None
 
-        # Exchange public keys
-        if self.client or self.server:
-            self._send_raw(bytes(str(my_public), "ascii"))
-            their_public = int(self._recv_raw())
+        self._negotiate_keys()
 
-            # Compute shared secret
-            self.shared_secret = calculate_dh_secret(their_public, my_private)
+    # Secure HKDF derivation for different roles (encryption, mac, iv)
+    def _extract(self, seed: bytes, label: bytes, size: int) -> bytes:
+        salt_value = SHA512.new(b'unique-salt-skynet-v2025').digest()
+        expander = HKDF(
+            algorithm=hashes.SHA512(),
+            length=size,
+            salt=salt_value,
+            info=label,
+            backend=default_backend()
+        )
+        return expander.derive(seed)
 
-            # Derive separate keys for encryption and MAC
-            self.aes_key = SHA256.new(self.shared_secret + b"enc").digest()
-            self.mac_key = SHA256.new(self.shared_secret + b"mac").digest()
+    # Perform key exchange and derive session keys
+    def _negotiate_keys(self):
+        pub_local, priv_local = generate_keypair()
 
-            if self.verbose:
-                print("Shared Secret (hash):", self.shared_secret.hex())
-                print("Derived AES key:", self.aes_key.hex())
-                print("Derived MAC key:", self.mac_key.hex())
+        if self.is_client or self.is_server:
+            self._push_data(bytes(str(pub_local), "utf-8"))
+            pub_remote = int(self._pull_data())
+            self._secret = compute_shared_secret(pub_remote, priv_local)
 
-    def pad(self, data):
-        pad_len = 16 - (len(data) % 16)
-        return data + bytes([pad_len] * pad_len)
+            self._enc_key = self._extract(self._secret, b"label-aes", 32)
+            self._mac_key = self._extract(self._secret, b"label-hmac", 32)
+            self._iv_seed = self._extract(self._secret, b"label-iv", 32)
 
-    def unpad(self, data):
-        pad_len = data[-1]
-        return data[:-pad_len]
+            if self.debug:
+                print("[keygen] DH secret:", self._secret.hex())
+                print("[keygen] AES key:", self._enc_key.hex())
+                print("[keygen] MAC key:", self._mac_key.hex())
+                print("[keygen] IV seed:", self._iv_seed.hex())
 
-    def encrypt_and_mac(self, message: bytes, nonce: bytes) -> bytes:
-        """
-        Format: nonce (8B) || IV (16B) || ciphertext || HMAC (32B)
-        """
-        if nonce in self.used_nonces:
-            raise ValueError("Replay attack detected!")
+    # Generate a fresh IV from base and incrementing counter
+    def _next_iv(self) -> bytes:
+        digest = HMAC.new(self._iv_seed, self._seq.to_bytes(8, 'big'), digestmod=SHA512).digest()
+        self._seq += 1
+        return digest[:16]
 
-        self.used_nonces.add(nonce)
-        iv = get_random_bytes(16)
+    # Generate a HMAC tag for a message
+    def _tag(self, payload: bytes) -> bytes:
+        mac = HMAC.new(self._mac_key, digestmod=SHA512)
+        mac.update(payload)
+        return mac.digest()
 
-        cipher = AES.new(self.aes_key, AES.MODE_CBC, iv)
-        padded = self.pad(message)
-        ciphertext = cipher.encrypt(padded)
+    # Validate HMAC tag
+    def _verify_tag(self, msg: bytes, tag: bytes):
+        verifier = HMAC.new(self._mac_key, digestmod=SHA512)
+        verifier.update(msg)
+        verifier.verify(tag)
 
-        tag = HMAC.new(self.mac_key, nonce + iv + ciphertext, digestmod=SHA256).digest()
+    # Encrypt and send data with integrity tag
+    def send(self, content: bytes):
+        if self._secret is None:
+            raise RuntimeError("Session key missing")
 
-        return nonce + iv + ciphertext + tag
+        nonce = self._next_iv()
+        encryptor = AES.new(self._enc_key, AES.MODE_CTR, nonce=nonce[:8])
+        encrypted = encryptor.encrypt(content)
+        signature = self._tag(encrypted)
 
-    def decrypt_and_verify(self, data: bytes) -> bytes:
-        nonce = data[:8]
-        iv = data[8:24]
-        ciphertext = data[24:-32]
-        recv_mac = data[-32:]
+        packet = encrypted + signature
+        length = struct.pack("H", len(packet))
+        self.socket.sendall(length + packet)
 
-        if nonce in self.used_nonces:
-            raise ValueError("Replay attack detected!")
+        self._outgoing = packet
 
-        self.used_nonces.add(nonce)
+        if self.debug:
+            print("[tx] Nonce:", nonce.hex())
+            print("[tx] Ciphertext:", encrypted.hex())
+            print("[tx] HMAC:", signature.hex())
 
-        # Verify MAC
-        tag = HMAC.new(self.mac_key, nonce + iv + ciphertext, digestmod=SHA256)
-        tag.verify(recv_mac)
-
-        # Decrypt
-        cipher = AES.new(self.aes_key, AES.MODE_CBC, iv)
-        padded = cipher.decrypt(ciphertext)
-        return self.unpad(padded)
-
-    def send(self, data: bytes):
-        """
-        Securely send encrypted and authenticated data.
-        """
-        if not self.shared_secret:
-            raise Exception("Secure session not established")
-
-        nonce = get_random_bytes(8)
-        encrypted = self.encrypt_and_mac(data, nonce)
-
-        pkt_len = struct.pack("H", len(encrypted))
-        self.conn.sendall(pkt_len)
-        self.conn.sendall(encrypted)
-
-        if self.verbose:
-            print("\n[send] Plaintext:", data)
-            print("[send] Encrypted:", encrypted.hex())
-            print("[send] Nonce:", nonce.hex())
-
+    # Receive and decrypt data
     def recv(self) -> bytes:
-        """
-        Receive and decrypt secure data.
-        """
-        pkt_len_packed = self.conn.recv(struct.calcsize("H"))
-        pkt_len = struct.unpack("H", pkt_len_packed)[0]
+        hdr = self.socket.recv(struct.calcsize("H"))
+        total = struct.unpack("H", hdr)[0]
+        blob = self.socket.recv(total)
 
-        encrypted_data = self.conn.recv(pkt_len)
-        decrypted = self.decrypt_and_verify(encrypted_data)
+        message = blob[:-64]
+        tag = blob[-64:]
 
-        if self.verbose:
-            print("\n[recv] Encrypted:", encrypted_data.hex())
-            print("[recv] Decrypted:", decrypted)
+        # Detect replayed packets
+        if blob in self._replay_check:
+            raise ValueError("Duplicate packet detected")
+        self._replay_check.add(blob)
 
-        return decrypted
+        self._verify_tag(message, tag)
 
-    def _send_raw(self, data: bytes):
-        length = struct.pack("H", len(data))
-        self.conn.sendall(length)
-        self.conn.sendall(data)
+        nonce = self._next_iv()
+        decryptor = AES.new(self._enc_key, AES.MODE_CTR, nonce=nonce[:8])
+        plain = decryptor.decrypt(message)
 
-    def _recv_raw(self) -> bytes:
-        length_data = self.conn.recv(struct.calcsize("H"))
-        length = struct.unpack("H", length_data)[0]
-        return self.conn.recv(length)
+        self._incoming = blob
+
+        if self.debug:
+            print("[rx] Nonce:", nonce.hex())
+            print("[rx] Ciphertext:", message.hex())
+            print("[rx] HMAC:", tag.hex())
+            print("[rx] Plaintext:", plain)
+
+        return plain
+
+    # Re-send last message sent (for testing)
+    def echo_last_out(self):
+        if self._outgoing:
+            self.socket.sendall(struct.pack("H", len(self._outgoing)) + self._outgoing)
+        else:
+            print("[echo] No sent message to replay.")
+
+    # Re-send last received packet (for testing)
+    def echo_last_in(self):
+        if self._incoming:
+            self.socket.sendall(struct.pack("H", len(self._incoming)) + self._incoming)
+        else:
+            print("[echo] No received packet to replay.")
+
+    # Raw sender with 2-byte header
+    def _push_data(self, data: bytes):
+        prefix = struct.pack("H", len(data))
+        self.socket.sendall(prefix + data)
+
+    # Raw receiver with length header
+    def _pull_data(self) -> bytes:
+        size_info = self.socket.recv(struct.calcsize("H"))
+        size = struct.unpack("H", size_info)[0]
+        return self.socket.recv(size)
 
     def close(self):
-        self.conn.close()
+        self.socket.close()
