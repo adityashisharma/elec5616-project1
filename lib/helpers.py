@@ -1,49 +1,33 @@
 import string
-from Crypto.Hash import HMAC, SHA256
 import secrets
-
-def read_hex(data):
-    """
-    Convert hex string (with or without spaces/newlines) to integer.
-    """
-    data = data.replace(" ", "").replace("\n", "")
-    return int(data, 16)
+from Crypto.Hash import HMAC, SHA512
 
 
-def generate_random_string(alphabet=None, length=8, exact=True):
-    """
-    Generate a secure random string using a CSPRNG.
-    """
-    if not alphabet:
-        alphabet = string.ascii_letters + string.digits
-
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
+def read_hex(src: str) -> int:  # Converts hex (with whitespace) into integer
+    cleaned = src.replace(" ", "").replace("\n", "")
+    return int(cleaned, 16)
 
 
-def appendMac(data: bytes, secret: bytes) -> bytes:
-    """
-    Appends HMAC-SHA256 to the data.
-    """
-    h = HMAC.new(secret, digestmod=SHA256)
-    h.update(data)
-    return data + h.digest()
+def generate_random_string(alphabet=None, length=8):  # Generates a secure random string
+    charset = alphabet or (string.ascii_letters + string.digits)
+    return ''.join(secrets.choice(charset) for _ in range(length))
 
 
-def macCheck(data: bytes, received_mac: bytes, secret: bytes) -> bool:
-    """
-    Verifies the HMAC of the data.
-    """
-    h = HMAC.new(secret, digestmod=SHA256)
-    h.update(data)
+def attach_mac(payload: bytes, key: bytes) -> bytes:  # Appends HMAC-SHA512 to data
+    mac = HMAC.new(key, digestmod=SHA512)
+    mac.update(payload)
+    return payload + mac.digest()
+
+
+def validate_mac(msg: bytes, tag: bytes, key: bytes) -> bool:  # Verifies HMAC using secret key
+    mac = HMAC.new(key, digestmod=SHA512)
+    mac.update(msg)
     try:
-        h.verify(received_mac)
+        mac.verify(tag)
         return True
     except ValueError:
         return False
 
 
-def appendSalt(data: bytes, length: int = 8) -> bytes:
-    """
-    Appends a random salt of `length` bytes to the data.
-    """
-    return data + secrets.token_bytes(length)
+def salt_data(msg: bytes, salt_len: int = 8) -> bytes:  # Appends secure random salt to data
+    return msg + secrets.token_bytes(salt_len)
